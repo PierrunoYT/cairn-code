@@ -3779,7 +3779,8 @@ impl Tui {
         if self.cmd_picker_sel >= self.cmd_picker_filtered.len() {
             self.cmd_picker_sel = self.cmd_picker_filtered.len().saturating_sub(1);
         }
-        // Keep flag for mouse/scroll guards; UI is ghost-only (no multi-line list).
+        // Gates the mouse/scroll guards and Esc dismissal for the Commands list
+        // rendered under the composer.
         self.show_command_picker = !self.cmd_picker_filtered.is_empty();
     }
 
@@ -4251,7 +4252,7 @@ pub(crate) const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/provider", "Switch the active provider"),
     ("/q", "Exit Cairn"),
     ("/quit", "Exit Cairn"),
-    ("/reset", "Show ChatGPT rate-limit reset times"),
+    ("/reset", "Manage ChatGPT rate-limit reset credits"),
     ("/resume", "Resume a saved session"),
     ("/save", "Save the current session"),
     ("/select", "Plain-text view for terminal selection"),
@@ -4276,6 +4277,9 @@ pub(crate) fn slash_completion_help(completion: &str) -> Option<&'static str> {
         ["/auth", "status"] => Some("Show credential status"),
         ["/auth", "key"] => Some("Paste an API key"),
         ["/theme", "list"] => Some("List theme names"),
+        ["/reset", "list"] => Some("List rate-limit reset credits"),
+        ["/reset", "status"] => Some("Alias for list"),
+        ["/reset", "apply"] => Some("Consume an available reset credit"),
         [_, "on"] => Some("Enable"),
         [_, "off"] => Some("Disable"),
         ["/auth", _, _] | ["/provider", _] => Some("provider"),
@@ -5114,6 +5118,29 @@ mod completion_tests {
         for (cmd, help) in SLASH_COMMANDS {
             assert!(!help.is_empty(), "{cmd} has no help text");
             assert_eq!(slash_completion_help(cmd), Some(*help));
+        }
+    }
+
+    /// Guards the whole class of bug rather than one command: any completion
+    /// the engine can offer has to carry a description, or it renders as a bare
+    /// row next to neighbours that have one.
+    #[test]
+    fn every_reachable_completion_has_help() {
+        let models = vec!["grok-4.5".to_string()];
+        let providers = vec!["xai".to_string()];
+        let themes = vec!["dune".to_string()];
+        let sessions = vec!["abc12345".to_string()];
+        let complete =
+            |input: &str| slash_completions(input, &all(), &models, &providers, &themes, &sessions);
+        for (cmd, _) in SLASH_COMMANDS {
+            // Arguments are offered once the root is followed by a space.
+            for one in complete(&format!("{cmd} ")) {
+                assert!(slash_completion_help(&one).is_some(), "no help for `{one}`");
+                // And one level deeper, e.g. `/auth login <provider>`.
+                for two in complete(&format!("{one} ")) {
+                    assert!(slash_completion_help(&two).is_some(), "no help for `{two}`");
+                }
+            }
         }
     }
 
