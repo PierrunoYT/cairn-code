@@ -16,6 +16,13 @@ const TAIL_CHARS: usize = 4_000;
 /// builds and test suites finish well inside this, and a command that needs
 /// more can still ask by passing `timeout`.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Ceiling on an explicit `timeout`. `process_runner` builds its deadline with
+/// `Instant::now().checked_add(..)` and degrades to *no* deadline when that
+/// overflows, so an absurd value — a model guessing, or a prompt injection
+/// picking `u64::MAX` — would otherwise restore the unbounded run this cap
+/// exists to prevent. A day is far beyond any legitimate command and leaves
+/// `checked_add` no way to fail.
+const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct ShellTool;
 
@@ -34,7 +41,7 @@ impl Tool for ShellTool {
     }
 
     fn input_schema(&self) -> String {
-        r#"{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"]}"#.into()
+        r#"{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","description":"Wall-clock limit in milliseconds (default 600000, maximum 86400000; larger values are capped)"}},"required":["command"]}"#.into()
     }
 
     fn execute(&self, input: &str) -> Result<String, String> {
@@ -68,7 +75,7 @@ impl Tool for ShellTool {
         let options = run_options_for(timeout_ms);
         let result = match process_runner::run(command, &options, Some(cancel)) {
             Ok(result) => result,
-            Err(error) => return Err(format_run_error(error, timeout_ms)),
+            Err(error) => return Err(format_run_error(error)),
         };
 
         let code = result.code;
@@ -116,10 +123,15 @@ impl Tool for ShellTool {
 ///
 /// Separated from `execute_with_cancel` so the timeout policy can be asserted
 /// without spawning a process: an omitted `timeout` must still carry a
-/// deadline, and an explicit one must win even when it exceeds the default.
+/// deadline, an explicit one must win even when it exceeds the default, and
+/// no input may produce a duration a deadline cannot be built from.
 fn run_options_for(timeout_ms: Option<u64>) -> RunOptions {
     RunOptions {
-        timeout: Some(timeout_ms.map_or(DEFAULT_TIMEOUT, Duration::from_millis)),
+        timeout: Some(
+            timeout_ms
+                .map_or(DEFAULT_TIMEOUT, Duration::from_millis)
+                .min(MAX_TIMEOUT),
+        ),
         head_chars: HEAD_CHARS,
         tail_chars: TAIL_CHARS,
     }
@@ -127,17 +139,17 @@ fn run_options_for(timeout_ms: Option<u64>) -> RunOptions {
 
 /// Turn a [`RunError`] into the shell tool's user-facing error string,
 /// preserving the historical "timed out" / "exec error" phrasing.
-fn format_run_error(error: RunError, timeout_ms: Option<u64>) -> String {
+///
+/// `after_ms` is the deadline the run actually enforced, so a request capped
+/// by [`MAX_TIMEOUT`] reports the cap rather than the number it asked for.
+fn format_run_error(error: RunError) -> String {
     match error {
         RunError::Spawn(message) => format!("exec error: {message}"),
         RunError::TimedOut {
             after_ms,
             cleanup_error,
         } => with_cleanup(
-            format!(
-                "command timed out after {}ms",
-                timeout_ms.unwrap_or(after_ms)
-            ),
+            format!("command timed out after {after_ms}ms"),
             &cleanup_error,
         ),
         RunError::Cancelled { cleanup_error } => {
@@ -192,6 +204,7 @@ fn truncate_head_tail(s: &str, max: usize, head: usize, tail: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn sleep_command(seconds: u64) -> String {
         if cfg!(windows) {
@@ -211,10 +224,9 @@ mod tests {
     }
 
     #[test]
-    fn test_no_timeout_runs_normally() {
+    fn omitted_timeout_still_runs_fast_commands() {
         let tool = ShellTool;
-        let cmd = if cfg!(windows) { "echo hi" } else { "echo hi" };
-        let input = format!(r#"{{"command":"{cmd}"}}"#);
+        let input = r#"{"command":"echo hi"}"#.to_string();
         let out = tool.execute(&input).unwrap();
         assert!(out.contains("hi"), "unexpected output: {out}");
         assert!(out.contains("(exit code 0)"), "missing exit footer: {out}");
@@ -236,6 +248,33 @@ mod tests {
         assert_eq!(
             run_options_for(Some(3_600_000)).timeout,
             Some(Duration::from_millis(3_600_000))
+        );
+    }
+
+    #[test]
+    fn oversized_timeout_is_capped_so_a_deadline_always_exists() {
+        // `process_runner` builds the deadline with `checked_add` and falls
+        // back to "no deadline" on overflow, so an unclamped huge value would
+        // run unbounded — the exact hang this tool's timeout exists to stop.
+        for requested in [
+            u64::MAX,
+            u64::MAX / 2,
+            1 << 53,
+            MAX_TIMEOUT.as_millis() as u64 + 1,
+        ] {
+            let timeout = run_options_for(Some(requested)).timeout.unwrap();
+            assert_eq!(timeout, MAX_TIMEOUT, "not capped: {requested}ms");
+            assert!(
+                Instant::now().checked_add(timeout).is_some(),
+                "no deadline for {requested}ms"
+            );
+        }
+
+        // The cap only bites above itself; a value just under it is untouched.
+        let under = MAX_TIMEOUT - Duration::from_millis(1);
+        assert_eq!(
+            run_options_for(Some(under.as_millis() as u64)).timeout,
+            Some(under)
         );
     }
 
