@@ -113,6 +113,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "/save · /sessions · /resume · /delete",
         "session management",
     ),
+    ("/crashes", "transcripts kept from failed runs"),
     ("/skills · /mcp", "list skills and MCP servers"),
     (
         "/reset · /reset apply",
@@ -2287,7 +2288,29 @@ impl Tui {
                 }
             }
             "/resume" => {
-                let sessions = session::list(&self.sessions_dir()).unwrap_or_default();
+                if parts.len() > 1 {
+                    // `/crashes` prints full `crash-…` ids for copying, so an
+                    // explicit id has to work — the picker alone would make
+                    // that output unusable.
+                    let query = parts[1..].join(" ");
+                    match session::resolve_id(&self.dir_for_id(&query), &query) {
+                        Ok(id) => self.resume_session(&id),
+                        Err(e) => {
+                            self.output_lines.push(OutputLine {
+                                type_: "error".into(),
+                                content: e,
+                                tool_name: String::new(),
+                                duration: String::new(),
+                            });
+                        }
+                    }
+                    return true;
+                }
+                // Crash transcripts come last: they are the exception, and a
+                // run of failures should not bury the sessions above them.
+                let mut sessions = session::list(&self.sessions_dir()).unwrap_or_default();
+                sessions
+                    .extend(session::list(&crate::config::crash_logs_dir()).unwrap_or_default());
                 if sessions.is_empty() {
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
@@ -2322,6 +2345,13 @@ impl Tui {
 
     fn sessions_dir(&self) -> String {
         crate::config::sessions_dir()
+    }
+
+    /// Directory to read `id` from. Crash transcripts live apart from ordinary
+    /// sessions, so every load path has to route on the id rather than assume
+    /// `sessions_dir` — otherwise `/resume` cannot reach what `/crashes` lists.
+    fn dir_for_id(&self, id: &str) -> String {
+        session::dir_for_id(&self.sessions_dir(), &crate::config::crash_logs_dir(), id).to_string()
     }
 
     fn open_model_picker(&mut self) {
@@ -2938,11 +2968,15 @@ impl Tui {
                 .filter(|v| v == "1" || v == "full")
                 .map(|_| format!("{}", std::backtrace::Backtrace::force_capture())),
         };
+        let crash_id = session::crash_id_for(&sess.id);
         let content =
             match session::write_crash_log(&crate::config::crash_logs_dir(), &sess, &crash) {
-                Ok(path) => {
-                    format!("Crash log saved to {path} — /resume restores this conversation")
-                }
+                // Name the id, not just the command: crash transcripts are not
+                // in the session directory, so `/resume` with no argument only
+                // reaches them by scrolling past every saved session.
+                Ok(path) => format!(
+                    "Crash log saved to {path} — /resume {crash_id} restores this conversation"
+                ),
                 // Reported rather than swallowed: if the transcript could not be
                 // preserved, the user should know before they close the terminal.
                 Err(e) => format!("Could not write crash log: {e}"),
@@ -3123,7 +3157,7 @@ impl Tui {
     }
 
     fn resume_session(&mut self, id: &str) {
-        match session::load(&self.sessions_dir(), id) {
+        match session::load(&self.dir_for_id(id), id) {
             Ok(sess) => {
                 // Rebuild TUI transcript including tool calls/results for continuity.
                 let mut lines = Vec::new();
@@ -3211,7 +3245,10 @@ impl Tui {
                 }
                 self.model = sess.model.clone();
                 self.provider = sess.provider.clone();
-                self.current_session_id = Some(sess.id.clone());
+                // Continue as the conversation the crash interrupted, not as
+                // the crash log: from here autosaves belong in sessions_dir.
+                let continues_as = session::session_id_from_crash_id(&sess.id).to_string();
+                self.current_session_id = Some(continues_as.clone());
                 self.session_created_at = if sess.created_at > 0 {
                     sess.created_at
                 } else {
@@ -3220,12 +3257,12 @@ impl Tui {
 
                 if let Some(tx) = &self.agent_tx {
                     let _ = tx.send(format!("__switch__:{}:{}", sess.provider, sess.model));
-                    let _ = tx.send(format!("__load_session__:{}", sess.id));
+                    let _ = tx.send(format!("__load_session__:{continues_as}"));
                 }
-                let short = if sess.id.len() >= 8 {
-                    &sess.id[..8]
+                let short = if continues_as.len() >= 8 {
+                    &continues_as[..8]
                 } else {
-                    sess.id.as_str()
+                    continues_as.as_str()
                 };
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
@@ -5476,6 +5513,51 @@ mod help_overlay_tests {
         tui.show_help = true;
         tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!tui.show_help);
+    }
+
+    #[test]
+    fn crashes_is_listed_in_help() {
+        assert!(
+            HELP_ROWS.iter().any(|(keys, _)| keys.contains("/crashes")),
+            "a command users are told to run must be discoverable in /help"
+        );
+    }
+}
+
+#[cfg(test)]
+mod crash_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn crash_ids_read_from_the_crash_directory_not_the_session_one() {
+        // /crashes writes to crash_logs_dir and tells the user /resume will
+        // restore it. Routing on the id is what makes that true.
+        let tui = Tui::new("test", "model", "provider", ".");
+        assert_eq!(
+            tui.dir_for_id("crash-1700000000-1"),
+            crate::config::crash_logs_dir()
+        );
+        assert_eq!(tui.dir_for_id("1700000000-1"), tui.sessions_dir());
+    }
+
+    #[test]
+    fn resume_with_an_id_reports_a_miss_instead_of_opening_the_picker() {
+        // `/resume <id>` used to be ignored: any argument silently fell
+        // through to the picker, so the id printed by /crashes did nothing.
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        tui.handle_command("/resume crash-definitely-not-a-real-id");
+
+        assert!(
+            !tui.show_session_picker,
+            "an explicit id must not fall through to the picker"
+        );
+        let last = tui.output_lines.last().expect("a line must be emitted");
+        assert_eq!(last.type_, "error");
+        assert!(
+            last.content.contains("crash-definitely-not-a-real-id"),
+            "unexpected message: {}",
+            last.content
+        );
     }
 }
 

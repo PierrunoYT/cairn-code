@@ -203,6 +203,41 @@ const CRASH_ID_PREFIX: &str = "crash-";
 /// still returning the transcripts beside them.
 const CRASH_INFO_EXT: &str = ".info";
 
+/// The crash-log id for a session id, as `/crashes` lists it and `/resume`
+/// accepts it.
+pub fn crash_id_for(session_id: &str) -> String {
+    format!("{CRASH_ID_PREFIX}{session_id}")
+}
+
+/// The session a crash transcript was written from. Ids that are not crash ids
+/// come back unchanged.
+///
+/// Resuming a crash log continues the original conversation, so the id it
+/// carries forward must be the ordinary one: autosaves go to `sessions_dir`,
+/// and an id left as `crash-…` there would be routed back to the crash
+/// directory by [`dir_for_id`], hiding everything written after the resume.
+pub fn session_id_from_crash_id(id: &str) -> &str {
+    id.strip_prefix(CRASH_ID_PREFIX).unwrap_or(id)
+}
+
+/// True when `id` names a crash transcript rather than an ordinary session.
+pub fn is_crash_id(id: &str) -> bool {
+    id.starts_with(CRASH_ID_PREFIX)
+}
+
+/// The directory an id lives in.
+///
+/// Crash transcripts are kept out of `sessions_dir` so `/sessions` is not
+/// diluted by failed runs, which means every read path — resume, resolve,
+/// picker — has to route on the id instead of assuming one directory.
+pub fn dir_for_id<'a>(sessions_dir: &'a str, crash_dir: &'a str, id: &str) -> &'a str {
+    if is_crash_id(id) {
+        crash_dir
+    } else {
+        sessions_dir
+    }
+}
+
 /// Writes a crash log: the transcript, plus a sidecar recording what ended the
 /// run.
 ///
@@ -217,7 +252,7 @@ pub fn write_crash_log(
     session: &Session,
     crash: &CrashInfo,
 ) -> Result<String, String> {
-    let id = format!("{CRASH_ID_PREFIX}{}", session.id);
+    let id = crash_id_for(&session.id);
     validate_id(&id)?;
     let crashed = Session {
         id: id.clone(),
@@ -227,17 +262,26 @@ pub fn write_crash_log(
     // a transcript contains whatever the user typed and whatever tools read.
     save(crash_dir, &crashed)?;
 
+    // Defense in depth. LLM errors arrive pre-redacted via `format_llm_err`,
+    // but any other `Err` string — and a backtrace's frames, paths, and
+    // captured arguments — can still carry token-shaped text. Escaping alone
+    // makes the JSON well-formed, not safe to hand to someone.
+    let error = crate::redact::redact_secrets(&crash.error);
+
     let mut info = format!(
         "{{\"session_id\":\"{}\",\"error\":\"{}\",\"timestamp\":{}",
         json_escape(&id),
-        json_escape(&crash.error),
+        json_escape(&error),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
     );
     if let Some(backtrace) = &crash.backtrace {
-        info.push_str(&format!(",\"backtrace\":\"{}\"", json_escape(backtrace)));
+        info.push_str(&format!(
+            ",\"backtrace\":\"{}\"",
+            json_escape(&crate::redact::redact_secrets(backtrace))
+        ));
     }
     info.push('}');
 
@@ -273,6 +317,9 @@ pub fn write_crash_log(
 /// Reads the error recorded alongside a crash transcript, if the sidecar is
 /// present and readable. A missing sidecar is not an error: the transcript is
 /// the part worth keeping.
+///
+/// Redacted again on the way out: the file may predate the redaction on write,
+/// or have been edited by hand, and this text goes straight to the screen.
 pub fn read_crash_error(crash_dir: &str, id: &str) -> Option<String> {
     let path = PathBuf::from(crash_dir).join(format!("{id}{CRASH_INFO_EXT}"));
     let raw = fs::read_to_string(path).ok()?;
@@ -280,7 +327,7 @@ pub fn read_crash_error(crash_dir: &str, id: &str) -> Option<String> {
         .ok()?
         .get("error")
         .and_then(|v| v.as_str())
-        .map(str::to_owned)
+        .map(crate::redact::redact_secrets)
 }
 
 pub fn list(sessions_dir: &str) -> Result<Vec<SessionSummary>, String> {
@@ -709,6 +756,129 @@ mod tests {
             Some("frame one\nframe two")
         );
         assert!(parsed.get("timestamp").and_then(|v| v.as_u64()).is_some());
+    }
+
+    #[test]
+    fn crash_log_round_trips_through_the_directory_its_id_routes_to() {
+        // The recovery path /crashes advertises: an id from that list must
+        // resolve and load without the caller knowing which directory holds
+        // it. Crash transcripts are not in sessions_dir, so a reader that
+        // assumes one directory finds nothing.
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        let crash_dir = temp.path().join("crash-logs");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&crash_dir).unwrap();
+        let sessions_dir = sessions_dir.to_string_lossy().to_string();
+        let crash_dir = crash_dir.to_string_lossy().to_string();
+
+        let session = sample_session(&format!("test-{}", new_id()));
+        save(&sessions_dir, &session).unwrap();
+        write_crash_log(
+            &crash_dir,
+            &session,
+            &CrashInfo {
+                error: "worker died".into(),
+                backtrace: None,
+            },
+        )
+        .unwrap();
+
+        let crash_id = crash_id_for(&session.id);
+        assert_eq!(
+            dir_for_id(&sessions_dir, &crash_dir, &crash_id),
+            crash_dir,
+            "crash ids must route to the crash directory"
+        );
+        assert_eq!(
+            dir_for_id(&sessions_dir, &crash_dir, &session.id),
+            sessions_dir,
+            "ordinary ids must keep routing to the session directory"
+        );
+
+        // Both halves of what /resume does: resolve the id, then load it.
+        for id in [crash_id.as_str(), session.id.as_str()] {
+            let dir = dir_for_id(&sessions_dir, &crash_dir, id);
+            let resolved = resolve_id(dir, id).expect("id must resolve");
+            let restored = load(dir, &resolved).expect("id must load");
+            assert_eq!(restored.messages.len(), 1, "{id}");
+            assert_eq!(restored.model, session.model, "{id}");
+        }
+
+        // A prefix works too, which is what a user actually types.
+        let prefix = &crash_id[..crash_id.len() - 4];
+        assert_eq!(
+            resolve_id(dir_for_id(&sessions_dir, &crash_dir, prefix), prefix).unwrap(),
+            crash_id
+        );
+    }
+
+    #[test]
+    fn a_resumed_crash_id_continues_the_original_session() {
+        // Carrying the crash id forward would send autosaves to sessions_dir
+        // under a `crash-` name, which dir_for_id then routes back to the
+        // crash directory — every message after the resume would be lost.
+        let id = "1700000000-1";
+        assert_eq!(session_id_from_crash_id(&crash_id_for(id)), id);
+        assert_eq!(session_id_from_crash_id(id), id, "plain ids pass through");
+        assert_eq!(
+            dir_for_id(
+                "sessions",
+                "crash-logs",
+                session_id_from_crash_id(&crash_id_for(id))
+            ),
+            "sessions"
+        );
+    }
+
+    #[test]
+    fn crash_sidecar_redacts_secrets_in_error_and_backtrace() {
+        // Not every Err reaching write_crash_log came through format_llm_err,
+        // and a backtrace can carry token-shaped text from captured arguments.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+        let session = sample_session(&format!("test-{}", new_id()));
+        let token = "sk-ant-api03-notarealkeybutlongenough";
+        write_crash_log(
+            &dir,
+            &session,
+            &CrashInfo {
+                error: format!("auth failed for {token}"),
+                backtrace: Some(format!("frame with Bearer {token}")),
+            },
+        )
+        .unwrap();
+
+        let id = crash_id_for(&session.id);
+        let raw =
+            fs::read_to_string(std::path::PathBuf::from(&dir).join(format!("{id}.info"))).unwrap();
+        assert!(
+            !raw.contains(token),
+            "sidecar leaked the token on disk: {raw}"
+        );
+        assert!(raw.contains("[REDACTED]"), "{raw}");
+
+        let shown = read_crash_error(&dir, &id).expect("sidecar must still parse");
+        assert!(!shown.contains(token), "displayed error leaked it: {shown}");
+        assert!(shown.starts_with("auth failed for "), "{shown}");
+    }
+
+    #[test]
+    fn crash_error_read_redacts_text_written_before_redaction_existed() {
+        // Logs on disk predate the write-side scrub, and this string goes
+        // straight to the screen.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+        let id = "crash-legacy";
+        fs::write(
+            temp.path().join(format!("{id}.info")),
+            r#"{"session_id":"crash-legacy","error":"token ghp_0123456789abcdefghij","timestamp":1}"#,
+        )
+        .unwrap();
+
+        let shown = read_crash_error(&dir, id).unwrap();
+        assert!(!shown.contains("ghp_0123456789abcdefghij"), "{shown}");
+        assert!(shown.contains("[REDACTED]"), "{shown}");
     }
 
     #[test]
