@@ -591,6 +591,20 @@ impl AnthropicStreamingResponse {
         }
     }
 
+    /// Emits any buffered text as an assistant message and clears the buffer.
+    ///
+    /// Called at every point a text block can end — its `content_block_stop`,
+    /// the start of the next block, and end of stream — so the buffer is never
+    /// carried across a boundary where it would be overwritten.
+    fn flush_text(&mut self) {
+        if !self.text_accum.is_empty() {
+            self.messages.push(Message {
+                role: "assistant".into(),
+                content: Content::Text(std::mem::take(&mut self.text_accum)),
+            });
+        }
+    }
+
     fn process_line<F>(&mut self, line: &str, on_chunk: &mut F) -> Result<(), String>
     where
         F: FnMut(&str, &str),
@@ -625,6 +639,12 @@ impl AnthropicStreamingResponse {
                 if let Some(block) = obj.get("content_block") {
                     match block.get("type").and_then(|v| v.as_str()) {
                         Some("text") => {
+                            // `text_accum` is assigned below, not appended, so
+                            // anything still buffered has to be emitted first.
+                            // content_block_stop normally does that; flushing
+                            // here as well means a stream that omits the stop
+                            // still cannot silently drop the previous block.
+                            self.flush_text();
                             if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                                 self.text_accum = text.to_string();
                                 on_chunk(text, "text");
@@ -636,13 +656,7 @@ impl AnthropicStreamingResponse {
                                     "Invalid Anthropic stream: tool call start missing block index"
                                         .to_string()
                                 })?;
-                            if !self.text_accum.is_empty() {
-                                self.messages.push(Message {
-                                    role: "assistant".into(),
-                                    content: Content::Text(self.text_accum.clone()),
-                                });
-                                self.text_accum.clear();
-                            }
+                            self.flush_text();
                             self.tool_input_accum.clear();
                             self.current_tool_use = Some((
                                 index,
@@ -737,6 +751,13 @@ impl AnthropicStreamingResponse {
                         role: "assistant".into(),
                         content: Content::ToolUse(tool_use),
                     });
+                } else {
+                    // A text (or thinking) block just closed. Emit its text now
+                    // rather than carrying it to end of stream: the next
+                    // content_block_start assigns over the buffer, so two
+                    // consecutive text blocks used to drop the first — after
+                    // on_chunk had already painted it on screen.
+                    self.flush_text();
                 }
             }
             Some("message_start") | Some("message_delta") => {
@@ -781,12 +802,8 @@ impl AnthropicStreamingResponse {
         if self.current_tool_use.is_some() {
             return Err("Invalid Anthropic stream: tool call did not complete".into());
         }
-        if !self.text_accum.is_empty() {
-            self.messages.push(Message {
-                role: "assistant".into(),
-                content: Content::Text(self.text_accum),
-            });
-        }
+        // Backstop for a stream whose last text block never closed.
+        self.flush_text();
         Ok((self.messages, self.usage))
     }
 }
@@ -969,6 +986,73 @@ mod tests {
         let error = parse_anthropic_streaming_response(raw).unwrap_err();
 
         assert!(error.contains("Malformed Anthropic stream event"));
+    }
+
+    fn texts_of(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|m| match &m.content {
+                Content::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_streaming_keeps_both_consecutive_text_blocks() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"FIRST\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"SECOND\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let (messages, _) = parse_anthropic_streaming_response(raw).unwrap();
+        assert_eq!(texts_of(&messages), vec!["FIRST", "SECOND"]);
+    }
+
+    #[test]
+    fn test_streaming_keeps_text_blocks_without_a_closing_stop() {
+        // A stream that omits content_block_stop must still not lose the first
+        // block, since the next start assigns over the buffer.
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"ALPHA\"}}\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"BETA\"}}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let (messages, _) = parse_anthropic_streaming_response(raw).unwrap();
+        assert_eq!(texts_of(&messages), vec!["ALPHA", "BETA"]);
+    }
+
+    #[test]
+    fn test_streaming_text_deltas_still_coalesce_within_a_block() {
+        // Flushing per block must not split a single block's deltas apart.
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"par\"}}\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ti\"}}\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"al\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let (messages, _) = parse_anthropic_streaming_response(raw).unwrap();
+        assert_eq!(texts_of(&messages), vec!["partial"]);
+    }
+
+    #[test]
+    fn test_streaming_text_around_a_tool_call_keeps_order() {
+        let raw = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"before\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"glob\",\"input\":{}}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"after\"}}\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        let (messages, _) = parse_anthropic_streaming_response(raw).unwrap();
+        assert_eq!(texts_of(&messages), vec!["before", "after"]);
+        assert_eq!(messages.len(), 3, "tool call must stay between the texts");
+        assert!(matches!(messages[1].content, Content::ToolUse(_)));
     }
 
     #[test]
