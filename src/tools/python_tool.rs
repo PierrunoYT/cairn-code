@@ -1,6 +1,8 @@
 //! Thin `python` tool: run a snippet (`code`) or a script file (`file` + `args`).
 //! Same idea as `shell` / `go` — spawn an interpreter on PATH, return stdout/stderr.
 
+use cap_fs_ext::DirExt;
+use std::path::{Component, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -75,14 +77,8 @@ impl Tool for PythonTool {
             cmd.arg("-c").arg(src);
         } else if let Some(path) = file {
             let ws = workspace::Workspace::current().map_err(|e| format!("workspace: {e}"))?;
-            let _ = ws
-                .relative_path(path)
-                .map_err(|e| format!("file path: {e}"))?;
-            let abs = std::path::Path::new(path);
-            if !abs.is_file() {
-                return Err(format!("file not found: {}", abs.display()));
-            }
-            cmd.arg(abs);
+            let abs = resolve_workspace_file(&ws, path)?;
+            cmd.arg(&abs);
             cmd.args(&args_list);
         }
 
@@ -156,6 +152,50 @@ impl Tool for PythonTool {
             Err(format!("exit code {code_n}\n{result}"))
         }
     }
+}
+
+/// Resolve `path` to an on-disk file under the workspace without ever
+/// following a symlink, mirroring the walk `grep`'s single-file search uses.
+/// `workspace.relative_path` alone only rejects `..`/absolute escapes
+/// lexically; a symlink planted inside the workspace (e.g. by a prior `shell`
+/// call) would still resolve outside it if we handed a raw std::fs path
+/// straight to the interpreter.
+fn resolve_workspace_file(ws: &workspace::Workspace, path: &str) -> Result<PathBuf, String> {
+    let relative = ws.relative_path(path)?;
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty() {
+        return Err(format!("file not found: {path}"));
+    }
+
+    let mut current = ws
+        .dir()
+        .try_clone()
+        .map_err(|e| format!("file path: cannot open workspace: {e}"))?;
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(format!("file path: invalid path component in {path}"));
+        };
+        let metadata = current
+            .symlink_metadata(name)
+            .map_err(|_| format!("file not found: {path}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("refusing to follow symlink: {path}"));
+        }
+        let is_last = index == components.len() - 1;
+        if is_last {
+            if !metadata.is_file() {
+                return Err(format!("file not found: {path}"));
+            }
+        } else {
+            if !metadata.is_dir() {
+                return Err(format!("file not found: {path}"));
+            }
+            current = current
+                .open_dir_nofollow(name)
+                .map_err(|e| format!("file path: {e}"))?;
+        }
+    }
+    Ok(ws.root().join(&relative))
 }
 
 /// Pick a Python interpreter: `python3`, then `python`, then Windows `py -3`.
@@ -274,5 +314,83 @@ mod tests {
             Ok((bin, _)) => assert!(!bin.is_empty()),
             Err(e) => assert!(e.contains("no Python"), "{e}"),
         }
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "cairn-python-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn resolve_workspace_file_accepts_real_file() {
+        let workspace_dir = temp_dir("ok");
+        fs::create_dir_all(workspace_dir.join("src")).unwrap();
+        fs::write(workspace_dir.join("src/main.py"), "print('hi')\n").unwrap();
+
+        let ws = workspace::Workspace::new(&workspace_dir).unwrap();
+        let resolved = resolve_workspace_file(&ws, "src/main.py").unwrap();
+        assert!(resolved.is_file(), "{}", resolved.display());
+        assert_eq!(resolved.file_name().unwrap(), "main.py");
+
+        let _ = fs::remove_dir_all(&workspace_dir);
+    }
+
+    #[test]
+    fn resolve_workspace_file_missing_file_errors() {
+        let ws = workspace::Workspace::current().unwrap();
+        let err = resolve_workspace_file(&ws, "cairn-definitely-missing-file.py").unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn resolve_workspace_file_rejects_parent_traversal() {
+        let ws = workspace::Workspace::current().unwrap();
+        let err = resolve_workspace_file(&ws, "../outside.py").unwrap_err();
+        assert!(err.contains("outside the workspace"), "{err}");
+    }
+
+    #[test]
+    fn resolve_workspace_file_rejects_symlink_escape() {
+        let workspace_dir = temp_dir("link");
+        let outside = temp_dir("link-outside");
+        fs::create_dir_all(&workspace_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.py"), "print('leaked')\n").unwrap();
+        let link = workspace_dir.join("escape");
+        assert!(
+            create_dir_link(&outside, &link),
+            "failed to create test link"
+        );
+
+        let ws = workspace::Workspace::new(&workspace_dir).unwrap();
+        let err = resolve_workspace_file(&ws, "escape/secret.py").unwrap_err();
+        assert!(
+            err.contains("symlink") || err.contains("not found"),
+            "{err}"
+        );
+
+        let _ = fs::remove_dir_all(&workspace_dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn create_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 }
