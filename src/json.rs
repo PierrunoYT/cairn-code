@@ -145,7 +145,7 @@ impl fmt::Display for JsonError {
 /// Backed by `serde_json`, which enforces a nesting limit — input arriving
 /// from providers, MCP servers, and model tool calls is untrusted, and an
 /// unbounded recursive parser would overflow the stack on deeply nested
-/// payloads. [`parse_standard`] adds a byte cap on top of that.
+/// payloads. Inputs over 16 MiB are rejected before parsing starts.
 pub fn parse(input: &str) -> Result<JsonValue, JsonError> {
     parse_standard(input)
 }
