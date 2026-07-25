@@ -6025,18 +6025,32 @@ const PERM_PREVIEW_MAX_LINES: usize = 8;
 /// Fields worth seeing first when a tool has them. This orders the preview; it
 /// does not decide what appears in it. Anything not listed still renders,
 /// alphabetically, after these.
+/// Row order for the permission preview, most decision-relevant first: what is
+/// being done, to what, with what. Only ordering — every field is shown either
+/// way — but with `PERM_PREVIEW_MAX_LINES` rows on screen, order decides what
+/// an approver reads before the fold.
 const PERM_PREFERRED_KEYS: &[&str] = &[
+    // `memory`'s verb: the remaining fields mean different things per action.
+    "action",
     "file_path",
     "path",
+    // `python`'s script path, distinct from `file_path` elsewhere.
+    "file",
     "command",
+    // `python`'s inline source: as consequential as `command`.
+    "code",
     "query",
     "url",
     "pattern",
     "old_string",
     "new_string",
     "content",
+    "key",
     "replace_all",
     "args",
+    // Last of the preferred keys, but ahead of the sorted remainder: a
+    // parameter worth seeing when a run hangs, not while approving one.
+    "timeout",
 ];
 
 /// One-line rendering of any JSON value for the permission preview.
@@ -6118,30 +6132,33 @@ fn format_permission_tool_input(input: &str) -> Vec<String> {
                 .filter(|k| !PERM_PREFERRED_KEYS.contains(&k.as_str()))
                 .collect();
             remaining.sort();
-            let ordered = PERM_PREFERRED_KEYS
+            let ordered: Vec<&str> = PERM_PREFERRED_KEYS
                 .iter()
                 .copied()
                 .filter(|k| obj.get(*k).is_some())
-                .chain(remaining.into_iter().map(String::as_str));
+                .chain(remaining.into_iter().map(String::as_str))
+                .collect();
 
-            let mut lines = Vec::new();
-            let mut rendered = 0usize;
-            for key in ordered {
-                if lines.len() >= PERM_PREVIEW_MAX_LINES {
-                    break;
-                }
-                let Some(v) = obj.get(key) else {
-                    continue;
-                };
-                lines.push(format!("{key}: {}", perm_value_display(v)));
-                rendered += 1;
-            }
+            let shown = ordered.len().min(PERM_PREVIEW_MAX_LINES);
+            let mut lines: Vec<String> = ordered[..shown]
+                .iter()
+                .filter_map(|key| {
+                    obj.get(*key)
+                        .map(|v| format!("{key}: {}", perm_value_display(v)))
+                })
+                .collect();
             if !lines.is_empty() {
-                // Counted against the object's real size, so fields dropped by
-                // the line cap are always reported.
-                if obj.len() > rendered {
-                    let extra = obj.len() - rendered;
-                    lines.push(format!("… (+{extra} more field(s))"));
+                // Name what the cap dropped. A bare count tells an approver
+                // that something is missing without telling them what, and a
+                // late `force` or `timeout` is exactly the field worth seeing
+                // before agreeing to the call.
+                let omitted = &ordered[shown..];
+                if !omitted.is_empty() {
+                    lines.push(format!(
+                        "… (+{} more: {})",
+                        omitted.len(),
+                        truncate_perm_value(&omitted.join(", "), PERM_VALUE_MAX_COLS)
+                    ));
                 }
                 return lines;
             }
@@ -6439,11 +6456,74 @@ mod tool_display_tests {
         let input = format!("{{{}}}", pairs.join(","));
         let lines = format_permission_tool_input(&input);
         assert_eq!(lines.len(), PERM_PREVIEW_MAX_LINES + 1, "{lines:?}");
+        // Named, not just counted: an approver can see which parameters they
+        // did not review.
         assert_eq!(
             lines.last().map(String::as_str),
-            Some("… (+4 more field(s))"),
+            Some("… (+4 more: k08, k09, k10, k11)"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn permission_preview_names_the_fields_the_cap_dropped() {
+        // The case that motivates naming them: a `force` sitting past the row
+        // cap is the one field an approver most needs to see.
+        let mut fields: Vec<String> = (0..PERM_PREVIEW_MAX_LINES)
+            .map(|i| format!("\"a{i:02}\":\"v\""))
+            .collect();
+        fields.push("\"force\":true".to_string());
+        let lines = format_permission_tool_input(&format!("{{{}}}", fields.join(",")));
+
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("… (+1 more: force)"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn permission_preview_truncates_a_long_list_of_omitted_names() {
+        // The footer is one row like any other: a tool with many long field
+        // names must not wrap it across the chrome.
+        let fields: Vec<String> = (0..40)
+            .map(|i| format!("\"a_rather_long_parameter_name_{i:02}\":\"v\""))
+            .collect();
+        let lines = format_permission_tool_input(&format!("{{{}}}", fields.join(",")));
+
+        let footer = lines.last().expect("footer must exist");
+        assert!(footer.starts_with("… (+32 more: "), "{footer}");
+        assert!(footer.ends_with("…)"), "footer must be truncated: {footer}");
+        assert!(
+            display_width(footer) <= PERM_VALUE_MAX_COLS + 16,
+            "footer too wide ({}): {footer}",
+            display_width(footer)
+        );
+    }
+
+    #[test]
+    fn permission_preview_puts_high_signal_first_party_keys_up_front() {
+        // These are ordinary parameters of first-party tools, and each decides
+        // what the call actually does.
+        let cases = [
+            (
+                r#"{"zzz":"z","action":"delete","key":"notes/plan"}"#,
+                vec!["action", "key", "zzz"],
+            ),
+            (
+                r#"{"timeout":5000,"code":"print(1)","unrelated":"u"}"#,
+                vec!["code", "timeout", "unrelated"],
+            ),
+            (
+                r#"{"args":["--x"],"file":"scripts/run.py","zzz":"z"}"#,
+                vec!["file", "args", "zzz"],
+            ),
+        ];
+        for (input, want) in cases {
+            let lines = format_permission_tool_input(input);
+            let keys: Vec<&str> = lines.iter().filter_map(|l| l.split(':').next()).collect();
+            assert_eq!(keys, want, "{input}");
+        }
     }
 
     #[test]
