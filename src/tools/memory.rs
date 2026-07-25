@@ -557,6 +557,22 @@ fn read_memory_bounded(
     })
 }
 
+/// Days since the Unix epoch (1970-01-01) to a proleptic Gregorian (year,
+/// month, day). Howard Hinnant's `civil_from_days`:
+/// <http://howardhinnant.github.io/date_algorithms.html>
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
 fn timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let dur = SystemTime::now()
@@ -564,14 +580,12 @@ fn timestamp() -> String {
         .unwrap_or_default();
     let secs = dur.as_secs();
     let nanos = dur.subsec_nanos();
-    let days = secs / 86400;
+    let days = (secs / 86400) as i64;
     let time_secs = secs % 86400;
     let hours = time_secs / 3600;
     let mins = (time_secs % 3600) / 60;
     let sec = time_secs % 60;
-    let year = 1970 + (days as f64 / 365.25) as u64;
-    let month = 1 + ((days as f64 / 30.44) as u64 % 12);
-    let day = 1 + (days as u64 % 28);
+    let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{hours:02}:{mins:02}:{sec:02}.{nanos:06}Z")
 }
 
@@ -729,6 +743,44 @@ mod tests {
         assert_eq!(budget.limit, Some(MemoryLimit::Deadline));
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(31), (1970, 2, 1));
+        assert_eq!(civil_from_days(59), (1970, 3, 1)); // 1970 is not a leap year
+        assert_eq!(civil_from_days(365), (1971, 1, 1));
+        assert_eq!(civil_from_days(10_957), (2000, 1, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29)); // leap day
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
+    }
+
+    #[test]
+    fn civil_from_days_covers_every_day_of_a_leap_year() {
+        // Regression: the old day/month math (`1 + days % 28`) could never
+        // produce day 29, 30, or 31 for any month.
+        let start = 10_957; // 2000-01-01
+        let mut saw_31 = false;
+        for offset in 0..366 {
+            let (year, month, day) = civil_from_days(start + offset);
+            assert_eq!(year, 2000);
+            assert!((1..=12).contains(&month), "month {month} out of range");
+            assert!((1..=31).contains(&day), "day {day} out of range");
+            saw_31 |= day == 31;
+        }
+        assert!(saw_31, "a 31-day month should produce day 31");
+    }
+
+    #[test]
+    fn timestamp_produces_a_plausible_date() {
+        let stamp = timestamp();
+        let year: u32 = stamp[0..4].parse().unwrap();
+        let month: u32 = stamp[5..7].parse().unwrap();
+        let day: u32 = stamp[8..10].parse().unwrap();
+        assert!(year >= 2026, "{stamp}");
+        assert!((1..=12).contains(&month), "{stamp}");
+        assert!((1..=31).contains(&day), "{stamp}");
     }
 
     #[test]
