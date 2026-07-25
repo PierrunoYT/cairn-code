@@ -86,7 +86,12 @@ impl Tool for PythonTool {
             cmd.args(&args_list);
         }
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Closed, not inherited: another direct spawn, and `input()` in
+        // model-supplied code is exactly the hang this closes — it would block
+        // on the terminal the TUI is drawing over.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         // Quiet child console on Windows.
         #[cfg(windows)]
         {

@@ -206,9 +206,14 @@ pub(crate) fn run_with_byte_limits(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<ByteLimitedOutput, ByteLimitedRunError> {
-    if stdin.is_some() {
-        command.stdin(Stdio::piped());
-    }
+    // Same reasoning as `run`: a child with nothing to be fed gets a closed
+    // stdin, not the TUI's terminal. Callers here (curl for web_fetch and
+    // web_search) do not read it today, but inheriting is the wrong default
+    // to leave lying around next to a raw-mode terminal.
+    match stdin {
+        Some(_) => command.stdin(Stdio::piped()),
+        None => command.stdin(Stdio::null()),
+    };
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = ManagedChild::spawn(command).map_err(ByteLimitedRunError::Spawn)?;
@@ -693,6 +698,21 @@ mod tests {
             result.stdout.contains("len=0"),
             "child saw stdin content: {:?}",
             result.stdout
+        );
+    }
+
+    #[test]
+    fn byte_limited_child_stdin_is_closed_when_there_is_nothing_to_send() {
+        // The sibling path: `run_with_byte_limits` piped stdin only when it had
+        // input, and inherited it otherwise. It has no timeout of its own, so a
+        // regression shows up as a hung run rather than a failed assertion —
+        // `len=0` is what proves the child reached EOF instead of the terminal.
+        let output = run_with_byte_limits(read_stdin_command(), None, 1024, 1024)
+            .expect("reading stdin must not block: it should be closed, not inherited");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("len=0"),
+            "child saw stdin content: {:?}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 

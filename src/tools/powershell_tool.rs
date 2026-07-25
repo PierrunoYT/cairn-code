@@ -58,6 +58,12 @@ impl Tool for PowerShellTool {
             .arg("-NonInteractive")
             .arg(flag)
             .arg(&command)
+            // Closed, not inherited: this tool spawns directly rather than
+            // through `process_runner::run`, so it needs the same guard. A
+            // script calling `Read-Host` would otherwise read the terminal the
+            // TUI holds in raw mode. `-NonInteractive` suppresses PowerShell's
+            // own prompts but not a read the script asks for itself.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
