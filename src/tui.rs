@@ -5781,87 +5781,70 @@ mod completion_tests {
     }
 }
 
+/// Code point ranges rendered two columns wide by terminals.
+///
+/// Ordered by first code point. Previously an if/else-if chain, which tripped
+/// `manual_range_contains` and `if_same_then_else` once per arm — around 54 of
+/// the crate's clippy warnings came from this one function.
+const WIDE_RANGES: &[(u32, u32)] = &[
+    (0x1100, 0x115F),
+    (0x2329, 0x232A),
+    (0x2600, 0x27BF), // misc symbols + dingbats
+    (0x2E80, 0x303E),
+    (0x3040, 0x3096),
+    (0x3099, 0x30FF),
+    (0x3105, 0x312F),
+    (0x3131, 0x318E),
+    (0x3190, 0x31E3),
+    (0x31F0, 0x321E),
+    (0x3220, 0x3247),
+    (0x3250, 0x4DBF),
+    (0x4E00, 0xA4CF),
+    (0xA960, 0xA97C),
+    (0xAC00, 0xD7A3),
+    (0xF900, 0xFAFF),
+    (0xFE10, 0xFE19),
+    (0xFE30, 0xFE6F),
+    (0xFF01, 0xFF60),
+    (0xFFE0, 0xFFE6),
+    (0x1B000, 0x1B0FF),
+    (0x1B100, 0x1B12F),
+    (0x1F000, 0x1F02F), // mahjong tiles
+    (0x1F0A0, 0x1F0FF), // playing cards
+    (0x1F100, 0x1F1FF), // enclosed alphanumerics / regional indicators
+    (0x1F200, 0x1F2FF),
+    (0x1F300, 0x1F9FF), // pictographs, emoticons, transport, supplemental
+    (0x1FA00, 0x1FAFF), // chess symbols, pictographs extended-A
+    (0x20000, 0x2FFFD),
+    (0x30000, 0x3FFFD),
+];
+
+/// Code point ranges that occupy no columns: combining marks, variation
+/// selectors, and the joiners used to build emoji sequences.
+const ZERO_WIDTH_RANGES: &[(u32, u32)] = &[
+    (0x0300, 0x036F),
+    (0x1AB0, 0x1AFF),
+    (0x1DC0, 0x1DFF),
+    (0x200D, 0x200D), // zero-width joiner
+    (0x20D0, 0x20FF),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF), // zero-width no-break space
+    (0xE0100, 0xE01EF),
+];
+
+fn in_ranges(cp: u32, ranges: &[(u32, u32)]) -> bool {
+    ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&cp))
+}
+
 fn char_width(c: char) -> usize {
     let cp = c as u32;
-    // Zero-width: combining marks, variation selectors, ZWJ (emoji sequences).
-    if (0x0300..=0x036F).contains(&cp)
-        || (0x1AB0..=0x1AFF).contains(&cp)
-        || (0x1DC0..=0x1DFF).contains(&cp)
-        || (0x20D0..=0x20FF).contains(&cp)
-        || (0xFE00..=0xFE0F).contains(&cp)
-        || (0xE0100..=0xE01EF).contains(&cp)
-        || cp == 0x200D
-        || cp == 0xFEFF
-    {
+    if in_ranges(cp, ZERO_WIDTH_RANGES) {
         return 0;
     }
     if cp < 0x1100 {
-        1
-    } else if cp <= 0x115F {
-        2
-    } else if cp >= 0x2329 && cp <= 0x232A {
-        2
-    } else if cp >= 0x2E80 && cp <= 0x303E {
-        2
-    } else if cp >= 0x3040 && cp <= 0x3096 {
-        2
-    } else if cp >= 0x3099 && cp <= 0x30FF {
-        2
-    } else if cp >= 0x3105 && cp <= 0x312F {
-        2
-    } else if cp >= 0x3131 && cp <= 0x318E {
-        2
-    } else if cp >= 0x3190 && cp <= 0x31E3 {
-        2
-    } else if cp >= 0x31F0 && cp <= 0x321E {
-        2
-    } else if cp >= 0x3220 && cp <= 0x3247 {
-        2
-    } else if cp >= 0x3250 && cp <= 0x4DBF {
-        2
-    } else if cp >= 0x4E00 && cp <= 0xA4CF {
-        2
-    } else if cp >= 0xA960 && cp <= 0xA97C {
-        2
-    } else if cp >= 0xAC00 && cp <= 0xD7A3 {
-        2
-    } else if cp >= 0xF900 && cp <= 0xFAFF {
-        2
-    } else if cp >= 0xFE10 && cp <= 0xFE19 {
-        2
-    } else if cp >= 0xFE30 && cp <= 0xFE6F {
-        2
-    } else if cp >= 0xFF01 && cp <= 0xFF60 {
-        2
-    } else if cp >= 0xFFE0 && cp <= 0xFFE6 {
-        2
-    } else if cp >= 0x1B000 && cp <= 0x1B0FF {
-        2
-    } else if cp >= 0x1B100 && cp <= 0x1B12F {
-        2
-    } else if cp >= 0x1F000 && cp <= 0x1F02F {
-        // Mahjong tiles
-        2
-    } else if cp >= 0x1F0A0 && cp <= 0x1F0FF {
-        // Playing cards
-        2
-    } else if cp >= 0x1F100 && cp <= 0x1F1FF {
-        // Enclosed alphanumerics / regional indicators (flags ~2 each)
-        2
-    } else if cp >= 0x1F200 && cp <= 0x1F2FF {
-        2
-    } else if cp >= 0x1F300 && cp <= 0x1F9FF {
-        // Misc symbols & pictographs, emoticons, transport, supplemental
-        2
-    } else if cp >= 0x1FA00 && cp <= 0x1FAFF {
-        // Chess symbols, symbols and pictographs extended-A (includes 🪨 U+1FAA8)
-        2
-    } else if cp >= 0x20000 && cp <= 0x2FFFD {
-        2
-    } else if cp >= 0x30000 && cp <= 0x3FFFD {
-        2
-    } else if cp >= 0x2600 && cp <= 0x27BF {
-        // Misc symbols + dingbats
+        return 1;
+    }
+    if in_ranges(cp, WIDE_RANGES) {
         2
     } else {
         1
