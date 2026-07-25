@@ -22,6 +22,8 @@ const MAX_RETRIES: u32 = 3;
 const BASE_BACKOFF_MS: u64 = 500;
 const CONNECT_TIMEOUT_SECS: &str = "10";
 const POST_TIMEOUT_SECS: &str = "600";
+/// Catalog endpoints (`/v1/models`) answer fast or not at all.
+const GET_TIMEOUT_SECS: &str = "12";
 /// Provider completions and model catalogs are normally far smaller than
 /// this. Eight MiB leaves ample room for unusually large completions/tool
 /// calls while bounding headers plus body before JSON parsing.
@@ -420,7 +422,19 @@ fn check_header(name: &str, value: &str) -> Result<(), RequestError> {
     Ok(())
 }
 
-fn curl_command(req: &HttpRequest) -> Result<Command, RequestError> {
+/// Builds every curl invocation this module makes.
+///
+/// The hardening below has to hold on both the POST and the GET path, and it
+/// only held on one of them until recently. One builder is what keeps them
+/// from drifting apart again: a new option added here cannot land on a single
+/// caller, and `check_header` cannot be skipped by a path that forgets it.
+fn curl_command_for(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    max_time: &str,
+    body_from_stdin: bool,
+) -> Result<Command, RequestError> {
     let mut cmd = Command::new("curl");
     // Must be the first argument so curl does not load settings (including
     // unsafe retry policies) from the user's curlrc.
@@ -429,7 +443,7 @@ fn curl_command(req: &HttpRequest) -> Result<Command, RequestError> {
         "-sS",
         "-i",
         "-X",
-        "POST",
+        method,
         // Confine the transport to HTTP(S) so a malformed base URL cannot
         // reach file:, scp:, or similar. `web_fetch` already does this; the
         // provider path had no equivalent.
@@ -438,23 +452,37 @@ fn curl_command(req: &HttpRequest) -> Result<Command, RequestError> {
         "--connect-timeout",
         CONNECT_TIMEOUT_SECS,
         "--max-time",
-        POST_TIMEOUT_SECS,
+        max_time,
     ]);
-    for (k, v) in &req.headers {
+    for (k, v) in headers {
         check_header(k, v)?;
         cmd.arg("-H").arg(format!("{k}: {v}"));
     }
     // Disable "Expect: 100-continue" so the response is a single header block,
     // which keeps status-line parsing simple for large request bodies.
     cmd.arg("-H").arg("Expect:");
-    cmd.arg("--data-binary").arg("@-");
+    if body_from_stdin {
+        cmd.arg("--data-binary").arg("@-");
+        cmd.stdin(Stdio::piped());
+    }
     // The URL goes last, behind `--`: everything after that separator is a
     // URL, so it must follow every option rather than precede them.
-    cmd.arg("--").arg(&req.url);
-    cmd.stdin(Stdio::piped());
+    cmd.arg("--").arg(url);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     Ok(cmd)
+}
+
+fn curl_command(req: &HttpRequest) -> Result<Command, RequestError> {
+    curl_command_for(
+        "POST",
+        &req.url,
+        &req.headers,
+        POST_TIMEOUT_SECS,
+        // The body is streamed in rather than passed as an argument: it can be
+        // megabytes, and it is never safe on a command line.
+        true,
+    )
 }
 
 fn spawn_curl(req: &HttpRequest) -> Result<ManagedChild, String> {
@@ -672,26 +700,7 @@ pub fn request_get(url: &str, headers: &[(String, String)]) -> Result<HttpRespon
 }
 
 fn request_get_once(url: &str, headers: &[(String, String)]) -> Result<HttpResponse, RequestError> {
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "-q",
-        "-sS",
-        "-i",
-        "-X",
-        "GET",
-        "--proto",
-        "=http,https",
-        "--max-time",
-        "12",
-    ]);
-    for (k, v) in headers {
-        check_header(k, v)?;
-        cmd.arg("-H").arg(format!("{k}: {v}"));
-    }
-    cmd.arg("-H").arg("Expect:");
-    cmd.arg("--").arg(url);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    let cmd = curl_command_for("GET", url, headers, GET_TIMEOUT_SECS, false)?;
     let output = run_curl_with_cap(cmd, None, RESPONSE_CAP_BYTES)?;
     if !output.status.success() {
         return Err(curl_exit_error(output.status, &output.stderr));
@@ -1218,30 +1227,66 @@ mod tests {
             .any(|args| args == ["--max-time", POST_TIMEOUT_SECS]));
     }
 
-    #[test]
-    fn test_post_curl_restricts_protocols_and_terminates_options() {
-        let req = HttpRequest {
-            url: "https://example.com/v1/messages".into(),
-            headers: vec![("x-api-key".into(), "k".into())],
-            body: Some("{}".into()),
-        };
-        let args: Vec<_> = curl_command(&req)
-            .expect("plain headers are accepted")
+    fn arg_strings(command: Command) -> Vec<String> {
+        command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+            .collect()
+    }
 
+    /// The hardening both request paths must satisfy, asserted the same way for
+    /// each so neither can quietly lose it.
+    fn assert_hardened(args: &[String], url: &str) {
+        assert_eq!(args.first().map(String::as_str), Some("-q"), "{args:?}");
         assert!(args.windows(2).any(|a| a == ["--proto", "=http,https"]));
+        assert!(args
+            .windows(2)
+            .any(|a| a == ["--connect-timeout", CONNECT_TIMEOUT_SECS]));
         // `--` must be the final option: everything after it is read as a URL,
         // so any option placed later would be sent as one instead.
         assert_eq!(
             args.iter().rev().take(2).cloned().collect::<Vec<_>>(),
-            vec![
-                "https://example.com/v1/messages".to_string(),
-                "--".to_string()
-            ],
+            vec![url.to_string(), "--".to_string()],
             "URL must be last, immediately behind `--`: {args:?}"
         );
+    }
+
+    #[test]
+    fn test_post_curl_restricts_protocols_and_terminates_options() {
+        let url = "https://example.com/v1/messages";
+        let req = HttpRequest {
+            url: url.into(),
+            headers: vec![("x-api-key".into(), "k".into())],
+            body: Some("{}".into()),
+        };
+        let args = arg_strings(curl_command(&req).expect("plain headers are accepted"));
+
+        assert_hardened(&args, url);
+        assert!(args
+            .windows(2)
+            .any(|a| a == ["--max-time", POST_TIMEOUT_SECS]));
+        assert!(args.windows(2).any(|a| a == ["--data-binary", "@-"]));
+    }
+
+    #[test]
+    fn test_get_curl_restricts_protocols_and_terminates_options() {
+        // The GET path had the same treatment applied by hand and no test
+        // holding it there. Both paths now come from one builder; this pins
+        // that the GET side really does carry the guarantees.
+        let url = "https://example.com/v1/models";
+        let headers = [("authorization".to_string(), "Bearer k".to_string())];
+        let args = arg_strings(
+            curl_command_for("GET", url, &headers, GET_TIMEOUT_SECS, false)
+                .expect("plain headers are accepted"),
+        );
+
+        assert_hardened(&args, url);
+        assert!(args
+            .windows(2)
+            .any(|a| a == ["--max-time", GET_TIMEOUT_SECS]));
+        // A GET sends no body: `--data-binary @-` would make curl wait on a
+        // stdin that nothing writes to.
+        assert!(!args.iter().any(|a| a == "--data-binary"), "{args:?}");
     }
 
     #[test]
@@ -1251,16 +1296,22 @@ mod tests {
             ("x-api-key", "abc\ndef"),
             ("x-bad\rname", "v"),
         ] {
-            let req = HttpRequest {
-                url: "https://example.com/".into(),
-                headers: vec![(name.into(), value.into())],
-                body: None,
-            };
-            let error = curl_command(&req)
+            let headers = vec![(name.to_string(), value.to_string())];
+            // Both request paths, not just the POST one: a header smuggled
+            // through the catalog request is the same injection.
+            for method in ["POST", "GET"] {
+                let error = curl_command_for(
+                    method,
+                    "https://example.com/",
+                    &headers,
+                    POST_TIMEOUT_SECS,
+                    method == "POST",
+                )
                 .err()
-                .unwrap_or_else(|| panic!("{name}: {value:?} should be rejected"))
+                .unwrap_or_else(|| panic!("{method} {name}: {value:?} should be rejected"))
                 .into_string();
-            assert!(error.contains("control character"), "{error}");
+                assert!(error.contains("control character"), "{method}: {error}");
+            }
         }
     }
 
