@@ -431,7 +431,7 @@ impl Tui {
                 chrome.push(Line::from(vec![Span::styled(
                     format!(
                         "{prefix}{}  {}  {} msgs  {time_str}",
-                        &s.id[..8],
+                        s.id.get(..8).unwrap_or(s.id.as_str()),
                         s.model,
                         s.msg_count
                     ),

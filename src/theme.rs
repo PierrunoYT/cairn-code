@@ -450,9 +450,9 @@ pub fn default_theme() -> Theme {
     build("dark", "dark", &DARK)
 }
 
-/// Resolve a theme name (case/space-insensitive). Falls back to dark.
+/// Resolve a theme name (case/space-insensitive), without falling back.
 /// `catppuccin` alone aliases Mocha for backward compatibility.
-pub fn lookup(name: &str) -> Theme {
+pub fn lookup_exact(name: &str) -> Option<Theme> {
     let mut key = name.trim().to_ascii_lowercase().replace(' ', "-");
     // ASCII fold: treat "frappé" typed without accent as frappe
     if key == "catppuccin-frappé" || key == "catppuccin-frappè" {
@@ -461,10 +461,13 @@ pub fn lookup(name: &str) -> Theme {
     if key == "catppuccin" {
         key = "catppuccin-mocha".into();
     }
-    all_themes()
-        .into_iter()
-        .find(|t| t.name == key)
-        .unwrap_or_else(default_theme)
+    all_themes().into_iter().find(|t| t.name == key)
+}
+
+/// Resolve a theme name (case/space-insensitive). Falls back to dark.
+/// `catppuccin` alone aliases Mocha for backward compatibility.
+pub fn lookup(name: &str) -> Theme {
+    lookup_exact(name).unwrap_or_else(default_theme)
 }
 
 pub fn theme_names() -> Vec<&'static str> {

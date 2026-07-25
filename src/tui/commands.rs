@@ -211,15 +211,16 @@ impl Tui {
                         return true;
                     }
                 };
-                if let Some(ref d) = cfg.skills_dir {
-                    std::env::set_var("CAIRN_SKILLS_DIR", d);
-                }
-                let list = crate::skills::load_skills();
                 let dir = cfg
                     .skills_dir
                     .as_ref()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(crate::skills::default_skills_dir);
+                let mut roots = vec![dir.clone()];
+                if let Some(a) = crate::skills::agents_skills_dir() {
+                    roots.push(a);
+                }
+                let list = crate::skills::load_from_roots(&roots);
                 if list.is_empty() {
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
@@ -347,13 +348,25 @@ impl Tui {
                     });
                 } else if parts.len() > 1 {
                     let name = parts[1..].join("-");
-                    let t = theme::lookup(&name);
-                    let applied = t.name.to_string();
-                    self.apply_theme_preference(
-                        t,
-                        self.theme.clone(),
-                        crate::config::save_theme(&applied),
-                    );
+                    match theme::lookup_exact(&name) {
+                        Some(t) => {
+                            let applied = t.name.to_string();
+                            self.apply_theme_preference(
+                                t,
+                                self.theme.clone(),
+                                crate::config::save_theme(&applied),
+                            );
+                        }
+                        None => {
+                            let names = theme::theme_names().join(", ");
+                            self.output_lines.push(OutputLine {
+                                type_: "error".into(),
+                                content: format!("Unknown theme '{name}'. Themes: {names}"),
+                                tool_name: String::new(),
+                                duration: String::new(),
+                            });
+                        }
+                    }
                 } else {
                     self.open_theme_picker();
                 }
@@ -917,6 +930,24 @@ mod provider_privacy_tests {
             rx.try_recv().is_err(),
             "cancellation must not leave a stale command queued"
         );
+    }
+}
+
+#[cfg(test)]
+mod theme_command_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_theme_name_is_rejected_without_changing_the_active_theme() {
+        let mut tui = Tui::new("test", "model", "provider", ".");
+        let previous = tui.theme.name.to_string();
+
+        tui.handle_command("/theme totally-bogus-theme");
+
+        assert_eq!(tui.theme.name, previous);
+        let line = tui.output_lines.last().unwrap();
+        assert_eq!(line.type_, "error");
+        assert!(line.content.contains("Unknown theme"), "{}", line.content);
     }
 }
 

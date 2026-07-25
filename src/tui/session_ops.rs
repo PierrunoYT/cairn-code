@@ -12,6 +12,8 @@ impl Tui {
                 }
             }
         }
+        let mut next_call_id: u64 = 0;
+        let mut last_tool_use_id = String::new();
         let messages = self
             .output_lines
             .iter()
@@ -27,10 +29,12 @@ impl Tui {
                         content: llm::Content::Text(l.content.clone()),
                     })
                 } else if l.type_ == "tool_use" {
+                    next_call_id += 1;
+                    last_tool_use_id = format!("call_{next_call_id}");
                     Some(llm::Message {
                         role: "assistant".into(),
                         content: llm::Content::ToolUse(llm::ToolUse {
-                            id: String::new(),
+                            id: last_tool_use_id.clone(),
                             name: l.tool_name.clone(),
                             input: l.content.clone(),
                         }),
@@ -39,7 +43,7 @@ impl Tui {
                     Some(llm::Message {
                         role: "user".into(),
                         content: llm::Content::ToolResult(llm::ToolResult {
-                            tool_use_id: String::new(),
+                            tool_use_id: last_tool_use_id.clone(),
                             content: l.content.clone(),
                         }),
                     })
@@ -171,12 +175,14 @@ impl Tui {
         for s in &sessions {
             let time_str = format_timestamp(s.updated_at);
             let summary = truncate_summary(&s.summary, 60);
+            let short = if s.id.len() >= 8 {
+                &s.id[..8]
+            } else {
+                s.id.as_str()
+            };
             msg.push_str(&format!(
                 "  {}  {}  {} msgs  {}\n",
-                &s.id[..8],
-                s.model,
-                s.msg_count,
-                time_str
+                short, s.model, s.msg_count, time_str
             ));
             if !summary.is_empty() {
                 msg.push_str(&format!("    {summary}\n"));
@@ -217,9 +223,11 @@ impl Tui {
             Ok(sess) => {
                 // Rebuild TUI transcript including tool calls/results for continuity.
                 let mut lines = Vec::new();
-                // Pair each tool_result with the preceding tool_use name so compact
-                // display rules still apply after /resume (results alone have no name).
-                let mut pending_tool_name = String::new();
+                // Pair each tool_result with its tool_use by id so compact display
+                // rules still apply after /resume (results alone have no name), even
+                // when multiple or out-of-order tool calls are in flight.
+                let mut pending_tool_names: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
                 for msg in &sess.messages {
                     match &msg.content {
                         llm::Content::Text(t) => {
@@ -261,7 +269,7 @@ impl Tui {
                             }
                         }
                         llm::Content::ToolUse(tu) => {
-                            pending_tool_name = tu.name.clone();
+                            pending_tool_names.insert(tu.id.clone(), tu.name.clone());
                             lines.push(OutputLine {
                                 type_: "tool_use".into(),
                                 content: tu.input.clone(),
@@ -270,11 +278,9 @@ impl Tui {
                             });
                         }
                         llm::Content::ToolResult(tr) => {
-                            let name = if pending_tool_name.is_empty() {
-                                "tool".into()
-                            } else {
-                                std::mem::take(&mut pending_tool_name)
-                            };
+                            let name = pending_tool_names
+                                .remove(&tr.tool_use_id)
+                                .unwrap_or_else(|| "tool".into());
                             lines.push(OutputLine {
                                 type_: "tool_result".into(),
                                 content: tr.content.clone(),
