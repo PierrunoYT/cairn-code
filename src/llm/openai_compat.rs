@@ -5,12 +5,31 @@ use std::collections::HashMap;
 /// Shared parsing/serialization for OpenAI-compatible chat-completions APIs
 /// (openai, ollama, openrouter, and opengateway all speak this dialect).
 
+/// Escapes a string for use inside a JSON string literal.
+///
+/// RFC 8259 requires every character below U+0020 to be escaped, not just the
+/// five with short forms. Emitting a raw control byte produces a body that no
+/// parser will accept, and these strings carry tool output: ANSI colour
+/// sequences (`ESC`, U+001B) come back from anything that writes coloured
+/// output, and `shell`'s `normalize_cli_output` only rewrites line endings, so
+/// they reach here intact.
 pub fn escape_json_str(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            // Everything else below U+0020 has no short form and needs \uXXXX.
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn build_messages_json(messages: &[Message], system: &str) -> String {
@@ -742,5 +761,69 @@ data: [DONE]
     fn test_escape_handles_newlines() {
         let escaped = escape_json_str("line1\nline2\ttabbed\r");
         assert_eq!(escaped, "line1\\nline2\\ttabbed\\r");
+    }
+
+    #[test]
+    fn escape_json_str_covers_every_c0_control() {
+        // The whole C0 range must survive a round trip through a real parser.
+        // Anything emitted raw produces a body no parser accepts.
+        for code in 0u32..0x20 {
+            let raw = format!("a{}b", char::from_u32(code).unwrap());
+            let body = format!("{{\"k\":\"{}\"}}", escape_json_str(&raw));
+            let parsed = json::parse(&body)
+                .unwrap_or_else(|e| panic!("U+{code:04X} produced unparseable JSON: {e}"));
+            let back = parsed
+                .as_object()
+                .and_then(|o| o.get("k"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("U+{code:04X} did not round trip"));
+            assert_eq!(back, raw, "U+{code:04X} changed value");
+        }
+    }
+
+    #[test]
+    fn escape_json_str_uses_short_forms_where_they_exist() {
+        assert_eq!(escape_json_str("\u{8}"), "\\b");
+        assert_eq!(escape_json_str("\u{c}"), "\\f");
+        // No short form: \uXXXX, lower-case hex, always four digits.
+        assert_eq!(escape_json_str("\u{1b}"), "\\u001b");
+        assert_eq!(escape_json_str("\u{0}"), "\\u0000");
+        assert_eq!(escape_json_str("\u{1f}"), "\\u001f");
+    }
+
+    #[test]
+    fn escape_json_str_survives_ansi_coloured_tool_output() {
+        // The realistic path: coloured build output arriving as a tool result.
+        let raw = "\u{1b}[32mok\u{1b}[0m \u{1b}[31mfail\u{1b}[0m\u{7}";
+        let body = format!("{{\"content\":\"{}\"}}", escape_json_str(raw));
+        let parsed = json::parse(&body).expect("ANSI output must produce valid JSON");
+        assert_eq!(
+            parsed
+                .as_object()
+                .and_then(|o| o.get("content"))
+                .and_then(|v| v.as_str()),
+            Some(raw)
+        );
+    }
+
+    #[test]
+    fn escape_json_str_leaves_printable_and_multibyte_alone() {
+        // DEL (U+007F) is not in C0 and JSON does not require escaping it.
+        let raw = "héllo 😀 中文 \u{7f} ~";
+        assert_eq!(escape_json_str(raw), raw);
+    }
+
+    #[test]
+    fn build_messages_json_stays_valid_with_control_characters() {
+        // End to end: a tool result carrying ESC must not break the body.
+        let messages = vec![Message {
+            role: "user".into(),
+            content: Content::ToolResult(ToolResult {
+                tool_use_id: "call_1".into(),
+                content: "\u{1b}[1mbuilding\u{1b}[0m\u{c}done".into(),
+            }),
+        }];
+        let body = format!("{{\"messages\":{}}}", build_messages_json(&messages, ""));
+        assert!(json::parse(&body).is_ok(), "{body}");
     }
 }
