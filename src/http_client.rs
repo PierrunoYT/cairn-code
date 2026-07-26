@@ -688,9 +688,7 @@ pub fn request_get(url: &str, headers: &[(String, String)]) -> Result<HttpRespon
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
-            Err(RequestError::Transport(_) | RequestError::RetryableTransport(_))
-                if attempt < MAX_RETRIES =>
-            {
+            Err(RequestError::RetryableTransport(_)) if attempt < MAX_RETRIES => {
                 attempt += 1;
                 std::thread::sleep(backoff_delay(attempt));
             }
