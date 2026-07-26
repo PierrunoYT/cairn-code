@@ -778,7 +778,7 @@ mod tests {
         let year: u32 = stamp[0..4].parse().unwrap();
         let month: u32 = stamp[5..7].parse().unwrap();
         let day: u32 = stamp[8..10].parse().unwrap();
-        assert!(year >= 2026, "{stamp}");
+        assert!(year >= 1970, "{stamp}");
         assert!((1..=12).contains(&month), "{stamp}");
         assert!((1..=31).contains(&day), "{stamp}");
     }

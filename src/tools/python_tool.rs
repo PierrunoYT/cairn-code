@@ -1,8 +1,8 @@
 //! Thin `python` tool: run a snippet (`code`) or a script file (`file` + `args`).
 //! Same idea as `shell` / `go` — spawn an interpreter on PATH, return stdout/stderr.
 
-use cap_fs_ext::DirExt;
-use std::path::{Component, PathBuf};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -73,12 +73,19 @@ impl Tool for PythonTool {
         let mut cmd = Command::new(&bin);
         cmd.args(&prefix_args);
 
+        // Kept alive until `cmd.spawn()`: on Unix the script fd is dup'd into
+        // the child from this descriptor at fork time (see attach_script_file),
+        // so it must still be open in our fd table when spawn() forks.
+        let mut _script_file: Option<std::fs::File> = None;
+
         if let Some(src) = code {
             cmd.arg("-c").arg(src);
         } else if let Some(path) = file {
             let ws = workspace::Workspace::current().map_err(|e| format!("workspace: {e}"))?;
-            let abs = resolve_workspace_file(&ws, path)?;
-            cmd.arg(&abs);
+            let (opened, abs) = resolve_workspace_file(&ws, path)?;
+            let script_arg = attach_script_file(&mut cmd, &opened, &abs);
+            _script_file = Some(opened);
+            cmd.arg(script_arg);
             cmd.args(&args_list);
         }
 
@@ -160,7 +167,17 @@ impl Tool for PythonTool {
 /// lexically; a symlink planted inside the workspace (e.g. by a prior `shell`
 /// call) would still resolve outside it if we handed a raw std::fs path
 /// straight to the interpreter.
-fn resolve_workspace_file(ws: &workspace::Workspace, path: &str) -> Result<PathBuf, String> {
+///
+/// Returns the file already opened through the validated directory chain
+/// (no-follow on every component) alongside a display path. The open handle
+/// matters: a plain path string handed back to the caller would let the
+/// Python subprocess re-resolve it from scratch, and a directory component
+/// could be swapped for a symlink between our walk and that second lookup.
+/// `attach_script_file` uses the handle to close that race on Unix.
+fn resolve_workspace_file(
+    ws: &workspace::Workspace,
+    path: &str,
+) -> Result<(std::fs::File, PathBuf), String> {
     let relative = ws.relative_path(path)?;
     let components: Vec<_> = relative.components().collect();
     if components.is_empty() {
@@ -171,6 +188,7 @@ fn resolve_workspace_file(ws: &workspace::Workspace, path: &str) -> Result<PathB
         .dir()
         .try_clone()
         .map_err(|e| format!("file path: cannot open workspace: {e}"))?;
+    let mut opened = None;
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(name) = component else {
             return Err(format!("file path: invalid path component in {path}"));
@@ -186,6 +204,12 @@ fn resolve_workspace_file(ws: &workspace::Workspace, path: &str) -> Result<PathB
             if !metadata.is_file() {
                 return Err(format!("file not found: {path}"));
             }
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let file = current
+                .open_with(name, &options)
+                .map_err(|e| format!("file path: {e}"))?;
+            opened = Some(file.into_std());
         } else {
             if !metadata.is_dir() {
                 return Err(format!("file not found: {path}"));
@@ -195,7 +219,48 @@ fn resolve_workspace_file(ws: &workspace::Workspace, path: &str) -> Result<PathB
                 .map_err(|e| format!("file path: {e}"))?;
         }
     }
-    Ok(ws.root().join(&relative))
+    let file = opened.ok_or_else(|| format!("file not found: {path}"))?;
+    Ok((file, ws.root().join(&relative)))
+}
+
+/// Point the child at the already-opened, symlink-verified script file
+/// instead of a path it would re-resolve itself.
+///
+/// On Unix this dups `file`'s descriptor into the child at a fixed fd and
+/// hands the interpreter `/dev/fd/<n>` — a magic path the kernel resolves to
+/// the existing open file description, not a fresh (and re-race-able)
+/// directory walk. `file` must stay alive (in the caller) until `spawn()`
+/// forks, since the dup happens from our still-open fd table.
+///
+/// There's no equivalent handle-passing path on Windows without unsafe,
+/// platform-specific process-creation APIs, so this falls back to the
+/// verified path there; junctions/symlinks require elevated privileges to
+/// create by default, which narrows that residual window considerably.
+#[cfg(unix)]
+fn attach_script_file(cmd: &mut Command, file: &std::fs::File, _abs: &Path) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    const CHILD_FD: i32 = 3;
+    let src_fd = file.as_raw_fd();
+    // Safety: dup2 is async-signal-safe, so it's sound to call between
+    // fork() and exec() here. This only touches fd CHILD_FD, so it can't
+    // collide with the stdio (0/1/2) redirection std sets up earlier in the
+    // same window.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(src_fd, CHILD_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    PathBuf::from(format!("/dev/fd/{CHILD_FD}"))
+}
+
+#[cfg(not(unix))]
+fn attach_script_file(_cmd: &mut Command, _file: &std::fs::File, abs: &Path) -> PathBuf {
+    abs.to_path_buf()
 }
 
 /// Pick a Python interpreter: `python3`, then `python`, then Windows `py -3`.
@@ -333,8 +398,8 @@ mod tests {
         fs::write(workspace_dir.join("src/main.py"), "print('hi')\n").unwrap();
 
         let ws = workspace::Workspace::new(&workspace_dir).unwrap();
-        let resolved = resolve_workspace_file(&ws, "src/main.py").unwrap();
-        assert!(resolved.is_file(), "{}", resolved.display());
+        let (file, resolved) = resolve_workspace_file(&ws, "src/main.py").unwrap();
+        assert!(file.metadata().unwrap().is_file());
         assert_eq!(resolved.file_name().unwrap(), "main.py");
 
         let _ = fs::remove_dir_all(&workspace_dir);
