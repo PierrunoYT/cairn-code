@@ -749,7 +749,7 @@ impl Tui {
         f.render_widget(
             Paragraph::new(Text::from(lines))
                 .wrap(Wrap { trim: false })
-                .scroll((body_scroll as u16, 0)),
+                .scroll((u16::try_from(body_scroll).unwrap_or(u16::MAX), 0)),
             body_area,
         );
 

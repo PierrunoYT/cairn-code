@@ -26,13 +26,7 @@ impl Tui {
         let sessions: Vec<String> = session::list(&self.sessions_dir())
             .unwrap_or_default()
             .into_iter()
-            .map(|s| {
-                if s.id.len() >= 8 {
-                    s.id[..8].to_string()
-                } else {
-                    s.id
-                }
-            })
+            .map(|s| s.id.get(..8).unwrap_or(s.id.as_str()).to_string())
             .collect();
 
         self.cmd_picker_filtered = slash_completions(

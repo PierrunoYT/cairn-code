@@ -132,7 +132,7 @@ impl Tui {
                 self.session_created_at = created_at;
                 self.last_checkpoint_save = Some(Instant::now());
                 if announce {
-                    let short = if id.len() >= 8 { &id[..8] } else { id.as_str() };
+                    let short = id.get(..8).unwrap_or(id.as_str());
                     self.output_lines.push(OutputLine {
                         type_: "system".into(),
                         content: format!(
@@ -145,6 +145,9 @@ impl Tui {
                 }
             }
             Err(e) => {
+                // Throttle retries on repeated failure too, so a stuck disk
+                // doesn't get hammered every checkpoint tick.
+                self.last_checkpoint_save = Some(Instant::now());
                 // Always surface write failures (including silent autosave).
                 self.output_lines.push(OutputLine {
                     type_: "error".into(),
@@ -175,11 +178,7 @@ impl Tui {
         for s in &sessions {
             let time_str = format_timestamp(s.updated_at);
             let summary = truncate_summary(&s.summary, 60);
-            let short = if s.id.len() >= 8 {
-                &s.id[..8]
-            } else {
-                s.id.as_str()
-            };
+            let short = s.id.get(..8).unwrap_or(s.id.as_str());
             msg.push_str(&format!(
                 "  {}  {}  {} msgs  {}\n",
                 short, s.model, s.msg_count, time_str
@@ -197,7 +196,7 @@ impl Tui {
     }
 
     pub(super) fn delete_session(&mut self, id: &str) {
-        let short = if id.len() >= 8 { &id[..8] } else { id };
+        let short = id.get(..8).unwrap_or(id);
         match session::delete(&self.sessions_dir(), id) {
             Ok(()) => {
                 self.output_lines.push(OutputLine {
@@ -318,11 +317,7 @@ impl Tui {
                     let _ = tx.send(format!("__switch__:{}:{}", sess.provider, sess.model));
                     let _ = tx.send(format!("__load_session__:{}", sess.id));
                 }
-                let short = if sess.id.len() >= 8 {
-                    &sess.id[..8]
-                } else {
-                    sess.id.as_str()
-                };
+                let short = sess.id.get(..8).unwrap_or(sess.id.as_str());
                 self.output_lines.push(OutputLine {
                     type_: "system".into(),
                     content: format!(

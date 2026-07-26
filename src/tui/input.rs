@@ -3,6 +3,18 @@
 use super::*;
 
 impl Tui {
+    /// True when a key should reach the hidden composer buffer rather than an
+    /// overlay (model/provider/theme/session picker, help, or shortcuts).
+    fn composer_has_focus(&self) -> bool {
+        self.awaiting_api_key
+            || (!self.show_model_picker
+                && !self.show_provider_picker
+                && !self.show_theme_picker
+                && !self.show_session_picker
+                && !self.show_help
+                && !self.show_shortcuts)
+    }
+
     /// Insert clipboard / bracketed-paste text into the composer at the cursor.
     /// Returns true if the buffer changed (needs redraw).
     pub(super) fn handle_paste(&mut self, data: &str) -> bool {
@@ -21,15 +33,7 @@ impl Tui {
             return true;
         }
         // Same gates as KeyCode::Char: don't hijack list pickers or overlays.
-        let allow = self.awaiting_api_key
-            || (!self.show_model_picker
-                && !self.show_provider_picker
-                && !self.show_theme_picker
-                && !self.show_session_picker
-                && !self.show_help
-                && !self.show_shortcuts
-                && !self.show_permission_prompt);
-        if !allow {
+        if !self.composer_has_focus() || self.show_permission_prompt {
             return false;
         }
         self.ctrl_c_exit_armed = false;
@@ -555,6 +559,9 @@ impl Tui {
                 if self.show_model_picker {
                     if self.picker_sel > 0 {
                         self.picker_sel -= 1;
+                        if self.picker_sel < self.picker_scrl {
+                            self.picker_scrl = self.picker_sel;
+                        }
                     }
                     return true;
                 }
@@ -926,7 +933,7 @@ impl Tui {
                 true
             }
             KeyCode::Backspace => {
-                if self.cursor > 0 && !self.show_model_picker && !self.show_provider_picker {
+                if self.cursor > 0 && self.composer_has_focus() {
                     let previous = self.input_buf[..self.cursor]
                         .char_indices()
                         .next_back()
@@ -959,7 +966,7 @@ impl Tui {
                     }
                     return true;
                 }
-                if self.cursor < self.input_buf.len() && !self.show_model_picker {
+                if self.cursor < self.input_buf.len() && self.composer_has_focus() {
                     self.input_buf.remove(self.cursor);
                 }
                 true
@@ -985,14 +992,7 @@ impl Tui {
                 }
                 // Allow typing into the API-key prompt and the normal input
                 // (but not while a list picker is focused).
-                if self.awaiting_api_key
-                    || (!self.show_model_picker
-                        && !self.show_provider_picker
-                        && !self.show_theme_picker
-                        && !self.show_session_picker
-                        && !self.show_help
-                        && !self.show_shortcuts)
-                {
+                if self.composer_has_focus() {
                     self.input_buf.insert(self.cursor, ch);
                     self.cursor += ch.len_utf8();
                     if !self.awaiting_api_key {
