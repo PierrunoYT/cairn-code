@@ -234,8 +234,10 @@ fn resolve_workspace_file(
 ///
 /// There's no equivalent handle-passing path on Windows without unsafe,
 /// platform-specific process-creation APIs, so this falls back to the
-/// verified path there; junctions/symlinks require elevated privileges to
-/// create by default, which narrows that residual window considerably.
+/// verified absolute path there. Python re-resolves that path independently
+/// of the open `File`, and the child retains no verified handle after the
+/// `File` is dropped. A path component can therefore change between the
+/// validation and Python's lookup, leaving a TOCTOU window.
 #[cfg(unix)]
 fn attach_script_file(cmd: &mut Command, file: &std::fs::File, _abs: &Path) -> PathBuf {
     use std::os::fd::AsRawFd;
