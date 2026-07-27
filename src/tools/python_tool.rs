@@ -243,13 +243,17 @@ fn attach_script_file(cmd: &mut Command, file: &std::fs::File, _abs: &Path) -> P
 
     const CHILD_FD: i32 = 3;
     let src_fd = file.as_raw_fd();
-    // Safety: dup2 is async-signal-safe, so it's sound to call between
-    // fork() and exec() here. This only touches fd CHILD_FD, so it can't
-    // collide with the stdio (0/1/2) redirection std sets up earlier in the
-    // same window.
+    // Safety: dup2 and fcntl are async-signal-safe, so they're sound to call
+    // between fork() and exec() here. This only touches fd CHILD_FD, so it
+    // can't collide with the stdio (0/1/2) redirection std sets up earlier in
+    // the same window.
     unsafe {
         cmd.pre_exec(move || {
             if libc::dup2(src_fd, CHILD_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // dup2 leaves FD_CLOEXEC unchanged when src_fd == CHILD_FD.
+            if libc::fcntl(CHILD_FD, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())

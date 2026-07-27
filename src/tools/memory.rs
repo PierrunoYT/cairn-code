@@ -766,7 +766,13 @@ mod tests {
             let (year, month, day) = civil_from_days(start + offset);
             assert_eq!(year, 2000);
             assert!((1..=12).contains(&month), "month {month} out of range");
-            assert!((1..=31).contains(&day), "day {day} out of range");
+            let max_day = match month {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 => 29,
+                _ => unreachable!(),
+            };
+            assert!((1..=max_day).contains(&day), "invalid date: {month}/{day}");
             saw_31 |= day == 31;
         }
         assert!(saw_31, "a 31-day month should produce day 31");
