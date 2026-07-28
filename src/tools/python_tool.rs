@@ -73,9 +73,9 @@ impl Tool for PythonTool {
         let mut cmd = Command::new(&bin);
         cmd.args(&prefix_args);
 
-        // Kept alive until `cmd.spawn()`: on Unix the script fd is dup'd into
-        // the child from this descriptor at fork time (see attach_script_file),
-        // so it must still be open in our fd table when spawn() forks.
+        // Kept alive until `cmd.spawn()`: on Unix this is the reserved script
+        // descriptor inherited by the child (see attach_script_file), so it
+        // must still be open in our fd table when spawn() forks.
         let mut _script_file: Option<std::fs::File> = None;
 
         if let Some(src) = code {
@@ -83,8 +83,8 @@ impl Tool for PythonTool {
         } else if let Some(path) = file {
             let ws = workspace::Workspace::current().map_err(|e| format!("workspace: {e}"))?;
             let (opened, abs) = resolve_workspace_file(&ws, path)?;
-            let script_arg = attach_script_file(&mut cmd, &opened, &abs);
-            _script_file = Some(opened);
+            let (script_arg, inherited) = attach_script_file(&mut cmd, opened, &abs)?;
+            _script_file = Some(inherited);
             cmd.arg(script_arg);
             cmd.args(&args_list);
         }
@@ -226,11 +226,11 @@ fn resolve_workspace_file(
 /// Point the child at the already-opened, symlink-verified script file
 /// instead of a path it would re-resolve itself.
 ///
-/// On Unix this dups `file`'s descriptor into the child at a fixed fd and
-/// hands the interpreter `/dev/fd/<n>` — a magic path the kernel resolves to
-/// the existing open file description, not a fresh (and re-race-able)
-/// directory walk. `file` must stay alive (in the caller) until `spawn()`
-/// forks, since the dup happens from our still-open fd table.
+/// On Unix this reserves a descriptor before spawning and hands the interpreter
+/// `/dev/fd/<n>` — a magic path the kernel resolves to the existing open file
+/// description, not a fresh (and re-race-able) directory walk. Reserving it in
+/// the parent prevents it from colliding with `Command`'s internal descriptors.
+/// The returned file must stay alive in the caller until `spawn()` forks.
 ///
 /// There's no equivalent handle-passing path on Windows without unsafe,
 /// platform-specific process-creation APIs, so this falls back to the
@@ -239,34 +239,51 @@ fn resolve_workspace_file(
 /// `File` is dropped. A path component can therefore change between the
 /// validation and Python's lookup, leaving a TOCTOU window.
 #[cfg(unix)]
-fn attach_script_file(cmd: &mut Command, file: &std::fs::File, _abs: &Path) -> PathBuf {
-    use std::os::fd::AsRawFd;
+fn attach_script_file(
+    cmd: &mut Command,
+    file: std::fs::File,
+    _abs: &Path,
+) -> Result<(PathBuf, std::fs::File), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
 
-    const CHILD_FD: i32 = 3;
-    let src_fd = file.as_raw_fd();
-    // Safety: dup2 and fcntl are async-signal-safe, so they're sound to call
-    // between fork() and exec() here. This only touches fd CHILD_FD, so it
-    // can't collide with the stdio (0/1/2) redirection std sets up earlier in
-    // the same window.
+    // Allocate this before spawn so Command's internal error-reporting pipe
+    // cannot receive the same descriptor. F_DUPFD_CLOEXEC also guarantees it
+    // is outside the stdio range even if one of 0/1/2 happens to be closed.
+    let child_fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if child_fd < 0 {
+        return Err(format!(
+            "file path: cannot reserve script descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // Safety: F_DUPFD_CLOEXEC returned a new descriptor owned by this process.
+    let inherited = unsafe { std::fs::File::from_raw_fd(child_fd) };
+
+    // Safety: fcntl is async-signal-safe, so it is sound to call between
+    // fork() and exec(). The descriptor is already reserved and only its
+    // close-on-exec flag is changed here.
     unsafe {
         cmd.pre_exec(move || {
-            if libc::dup2(src_fd, CHILD_FD) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // dup2 leaves FD_CLOEXEC unchanged when src_fd == CHILD_FD.
-            if libc::fcntl(CHILD_FD, libc::F_SETFD, 0) < 0 {
+            if libc::fcntl(child_fd, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    PathBuf::from(format!("/dev/fd/{CHILD_FD}"))
+    Ok((
+        PathBuf::from(format!("/dev/fd/{child_fd}")),
+        inherited,
+    ))
 }
 
 #[cfg(not(unix))]
-fn attach_script_file(_cmd: &mut Command, _file: &std::fs::File, abs: &Path) -> PathBuf {
-    abs.to_path_buf()
+fn attach_script_file(
+    _cmd: &mut Command,
+    file: std::fs::File,
+    abs: &Path,
+) -> Result<(PathBuf, std::fs::File), String> {
+    Ok((abs.to_path_buf(), file))
 }
 
 /// Pick a Python interpreter: `python3`, then `python`, then Windows `py -3`.
@@ -416,6 +433,19 @@ mod tests {
         let ws = workspace::Workspace::current().unwrap();
         let err = resolve_workspace_file(&ws, "cairn-definitely-missing-file.py").unwrap_err();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn resolve_workspace_file_rejects_file_as_directory() {
+        let workspace_dir = temp_dir("file-as-dir");
+        fs::create_dir_all(&workspace_dir).unwrap();
+        fs::write(workspace_dir.join("not_a_dir"), "x").unwrap();
+
+        let ws = workspace::Workspace::new(&workspace_dir).unwrap();
+        let err = resolve_workspace_file(&ws, "not_a_dir/inner.py").unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+
+        let _ = fs::remove_dir_all(&workspace_dir);
     }
 
     #[test]
