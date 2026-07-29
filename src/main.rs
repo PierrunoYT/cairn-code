@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::{io::Read, process::ExitCode};
 
-use cairn_code::agent::{Agent, AgentEvent};
+use cairn_code::agent::{Agent, AgentEvent, ApprovalMode};
 use cairn_code::config::{self, Config};
 use cairn_code::llm::provider;
 use cairn_code::{http_client, llm, oauth, session, skills, tools, tui};
@@ -19,6 +19,7 @@ fn main() -> ExitCode {
     let mut exec_cwd: Option<String> = None;
     let mut exec_resume: Option<String> = None;
     let mut exec_init_session_id: Option<String> = None;
+    let mut exec_auto_approve = false;
 
     if is_exec_mode {
         let mut i = 2;
@@ -42,11 +43,14 @@ fn main() -> ExitCode {
                         i += 1;
                     }
                 }
-                "--input-format" | "--output-format" | "--auto" => {
+                "--input-format" | "--output-format" => {
                     if i + 1 < raw_args.len() {
                         i += 1;
                     }
                 }
+                // Valueless: consuming the next argument here used to swallow
+                // whatever followed (`exec --auto --resume ID` lost --resume).
+                "--auto" => exec_auto_approve = true,
                 "--no-completion-gate" => {}
                 _ => {}
             }
@@ -173,17 +177,12 @@ fn main() -> ExitCode {
         );
 
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>();
-        let (perm_tx, perm_rx) = mpsc::channel::<String>();
+        // exec has no user behind it, so nothing may answer an approval
+        // prompt. The channel exists only to satisfy `run`'s signature; the
+        // agent's approval mode below is what actually decides authorization.
+        let (_perm_tx, perm_rx) = mpsc::channel::<String>();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel2 = cancel.clone();
-        let perm_cancel = cancel.clone();
-
-        thread::spawn(move || {
-            while !perm_cancel.load(Ordering::Relaxed) {
-                let _ = perm_tx.send("allow".to_string());
-                thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
 
         let mut agent = Agent::new_with_skills(
             chosen_provider,
@@ -192,6 +191,18 @@ fn main() -> ExitCode {
             cfg,
             skills_for_agent,
         );
+        // Without --auto, exec fails closed exactly like --print: a tool that
+        // needs approval is refused rather than run unattended, and explicit
+        // `auto_allow` config is the only way to permit one.
+        agent.set_approval_mode(if exec_auto_approve {
+            eprintln!(
+                "warning: --auto approves every tool call in this run without prompting; \
+                 only the config deny list still applies"
+            );
+            ApprovalMode::AutoApproveAll
+        } else {
+            ApprovalMode::FailClosed
+        });
 
         thread::spawn(move || {
             let _ = agent.run(&prompt, event_tx, &cancel2, &perm_rx);

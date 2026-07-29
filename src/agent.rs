@@ -36,6 +36,26 @@ const SUMMARY_MAX_TOKENS: usize = 1024;
 
 const SUMMARY_SYSTEM_PROMPT: &str = "You are compacting an in-progress coding session's history so it fits in a smaller context window. Summarize the conversation below concisely but completely: preserve file paths touched, decisions made, and any outstanding/unfinished tasks. Write plain prose, not a transcript. Do not use tools.";
 
+/// How a run answers a tool call that the deny/ask/`auto_allow` policy says
+/// needs approval.
+///
+/// This is the run's *authorization posture*, deliberately separate from
+/// whether the caller happens to hold a permission channel. A caller that owns
+/// an event channel for streaming (`exec`) is not thereby a user who can
+/// consent, so the two must not be inferred from one another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ApprovalMode {
+    /// Ask the human: emit `PermissionRequest` and wait for the answer.
+    #[default]
+    Interactive,
+    /// No human to ask, so approval-requiring tools fail closed. An explicit
+    /// `auto_allow` entry in config is the only way to permit one.
+    FailClosed,
+    /// Approve every tool call without asking. Only ever set from an explicit
+    /// operator opt-in (`exec --auto`), never inferred.
+    AutoApproveAll,
+}
+
 pub struct Agent {
     provider: Box<dyn llm::Provider>,
     model: String,
@@ -48,6 +68,8 @@ pub struct Agent {
     live_mirror: Option<crate::session::LiveMirror>,
     /// Skill catalog (names/descriptions); bodies loaded via the `skill` tool.
     skills: Vec<crate::skills::Skill>,
+    /// Authorization posture for tool calls that require approval.
+    approval: ApprovalMode,
 }
 
 impl Agent {
@@ -78,7 +100,15 @@ impl Agent {
             last_input_tokens: 0,
             live_mirror: None,
             skills,
+            approval: ApprovalMode::default(),
         }
+    }
+
+    /// Sets the authorization posture for this run. Callers with no user to
+    /// prompt must set [`ApprovalMode::FailClosed`]; only an explicit operator
+    /// opt-in may set [`ApprovalMode::AutoApproveAll`].
+    pub fn set_approval_mode(&mut self, mode: ApprovalMode) {
+        self.approval = mode;
     }
 
     pub fn set_live_mirror(&mut self, mirror: crate::session::LiveMirror) {
@@ -436,6 +466,13 @@ impl Agent {
     /// would otherwise require approval fails closed instead of running
     /// unattended; the only way to permit it is an explicit `auto_allow`
     /// entry in config.
+    ///
+    /// [`Agent::set_approval_mode`] overrides that per run, and it is the
+    /// authority: holding the channels does not make a run interactive. A
+    /// caller that streams events but has no human behind them (`exec`) sets
+    /// [`ApprovalMode::FailClosed`] and the channels are ignored here, so
+    /// approval cannot be granted by whatever happens to be feeding
+    /// `perm_rx`.
     fn execute_tool_with_policy(
         &mut self,
         tu: &llm::ToolUse,
@@ -461,19 +498,29 @@ impl Agent {
         }
 
         // Cancellation reaches synchronous tool execution through this token.
-        // Interactive callers pass the live cancel flag; non-interactive
-        // callers (e.g. --print) have no user to cancel, so they never do.
+        // Any caller that supplied one gets it, regardless of approval posture:
+        // `exec` cannot approve tools but can still abort a running one.
+        // Callers with no token at all (e.g. --print) never cancel.
         static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
         let cancel_flag: &AtomicBool = match interactive {
             Some((_, cancel, _)) => cancel,
             None => &NEVER_CANCEL,
         };
 
-        if !needs_ask || always_allowed {
+        // The approval posture decides how (and whether) a human is consulted,
+        // and it is what makes the permission channel usable. `deny` is checked
+        // above, so `--auto` widens approval but never overrides a denial.
+        let auto_approve_all = self.approval == ApprovalMode::AutoApproveAll;
+        let approval_channels = match self.approval {
+            ApprovalMode::Interactive => interactive,
+            ApprovalMode::FailClosed | ApprovalMode::AutoApproveAll => None,
+        };
+
+        if !needs_ask || always_allowed || auto_approve_all {
             return self.dispatch_tool(tu, cancel_flag);
         }
 
-        let Some((tx, cancel, perm_rx)) = interactive else {
+        let Some((tx, cancel, perm_rx)) = approval_channels else {
             return Err(format!(
                 "Tool '{}' requires approval and there is no user to prompt in this mode. \
                  Add it to auto_allow in the config to permit it non-interactively.",
@@ -1452,6 +1499,112 @@ mod tests {
         assert!(err.contains("Permission denied"), "{err}");
         assert!(err.contains("use a safer alternative"), "{err}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// C-1 regression: `exec` mode used to spawn a thread that pumped "allow"
+    /// into the permission channel 20x/second, so every approval-gated tool
+    /// ran unattended. A run with no user behind it must fail closed even
+    /// while something is feeding `perm_rx` — holding the channels is not
+    /// consent.
+    #[test]
+    fn fail_closed_mode_ignores_a_permission_channel_answering_allow() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        agent.set_approval_mode(ApprovalMode::FailClosed);
+        let (event_tx, event_rx) = mpsc::channel();
+        let (perm_tx, perm_rx) = mpsc::channel();
+        // Exactly what the deleted auto-allow thread did.
+        for _ in 0..8 {
+            perm_tx.send("allow".into()).unwrap();
+        }
+
+        let err = agent
+            .execute_tool_with_policy(
+                &test_tool_use("dangerous"),
+                Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+            )
+            .unwrap_err();
+
+        assert!(err.contains("approval"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "fail-closed runs must not emit a prompt nobody can answer"
+        );
+    }
+
+    /// The explicit `auto_allow` opt-in still works in a fail-closed run, so
+    /// automation can permit specific tools without opening everything.
+    #[test]
+    fn fail_closed_mode_runs_tool_explicitly_auto_allowed() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow = vec!["dangerous".into()];
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        agent.set_approval_mode(ApprovalMode::FailClosed);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (_perm_tx, perm_rx) = mpsc::channel();
+
+        let result = agent.execute_tool_with_policy(
+            &test_tool_use("dangerous"),
+            Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+        );
+
+        assert_eq!(result.unwrap(), "recorded execution");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// `exec --auto` is the opt-in that restores unattended execution.
+    #[test]
+    fn auto_approve_all_mode_runs_approval_required_tool_without_prompting() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.auto_allow.clear();
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        agent.set_approval_mode(ApprovalMode::AutoApproveAll);
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_perm_tx, perm_rx) = mpsc::channel();
+
+        let result = agent.execute_tool_with_policy(
+            &test_tool_use("dangerous"),
+            Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+        );
+
+        assert_eq!(result.unwrap(), "recorded execution");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(event_rx.try_recv().is_err(), "--auto must not prompt");
+    }
+
+    /// `--auto` widens approval; it must not override an explicit denial.
+    #[test]
+    fn auto_approve_all_mode_still_respects_the_deny_list() {
+        let mut config = Config::default();
+        config.ask.clear();
+        config.deny.push("dangerous".into());
+        let (mut agent, calls) = agent_with_tool_call("dangerous", true, config);
+        agent.set_approval_mode(ApprovalMode::AutoApproveAll);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (_perm_tx, perm_rx) = mpsc::channel();
+
+        let err = agent
+            .execute_tool_with_policy(
+                &test_tool_use("dangerous"),
+                Some((&event_tx, &AtomicBool::new(false), &perm_rx)),
+            )
+            .unwrap_err();
+
+        assert!(err.contains("denied by config"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The TUI path must be untouched: default mode still prompts.
+    #[test]
+    fn default_approval_mode_is_interactive() {
+        let config = Config::default();
+        let (agent, _calls) = agent_with_tool_call("dangerous", true, config);
+        assert_eq!(agent.approval, ApprovalMode::Interactive);
     }
 
     #[test]
