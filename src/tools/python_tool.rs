@@ -271,10 +271,7 @@ fn attach_script_file(
             Ok(())
         });
     }
-    Ok((
-        PathBuf::from(format!("/dev/fd/{child_fd}")),
-        inherited,
-    ))
+    Ok((PathBuf::from(format!("/dev/fd/{child_fd}")), inherited))
 }
 
 #[cfg(not(unix))]
